@@ -1,28 +1,23 @@
-# Discord Ticket Viewers Bot (RTDB first, Firestore fallback) - v3 (cache-skip)
+# Discord Ticket Viewers Bot - v4 (autoload + progress logs)
 
-## What changed
-- Before computing viewers, the bot reads existing data from DB (RTDB first, fallback Firestore).
-- If a ticket channel already has stored viewers, it will **skip recomputing** that channel (fast).
-  - Channel entry includes `"source": "cache_skip"` when skipped.
-
-## What it does
-- Slash command: `/start bot_role category1 [category2] [category3]`
-- Scans channels inside selected categories
-- Keeps ONLY channels whose name contains `ticket` (case-insensitive)
-- For each ticket channel, saves viewers list with rules:
-  - must have the selected role
-  - if they have ANY other role with Administrator permission -> skipped
-
-## Storage logic
-- Writes to Firebase Realtime Database first (needs `FIREBASE_DATABASE_URL`)
-- If RTDB fails or not configured -> writes to Firestore (fallback)
+## New in v4
+- Auto-load stored `/start` config from DB on startup and run an update pass immediately.
+- Render logs show what the bot is doing:
+  - counts viewers with progress: 10,20,30,... (configurable via `PROGRESS_STEP`)
+  - prints summary of updated channels and skipped (cached) channels
+- Still RTDB-first with Firestore fallback.
+- `/favicon.ico` returns 204 to avoid noisy 404 logs.
 
 ## Environment Variables
 - DISCORD_TOKEN
 - FIREBASE_JSON
-- FIREBASE_DATABASE_URL (optional, enables RTDB)
-- AUTO_UPDATE_SECONDS (optional, default 60)
-- FIREBASE_COLLECTION (optional)
+- FIREBASE_DATABASE_URL (optional, enables RTDB; otherwise Firestore fallback)
+- AUTO_UPDATE_SECONDS (default 60)
+- FIREBASE_COLLECTION (default discord_configs)
 
-## Note
-With cache-skip enabled, changes in permissions/roles will NOT be reflected for channels that were previously stored (until you delete that channel entry from DB).
+## Progress logging controls (optional)
+- PROGRESS_STEP (default 10)
+- MAX_PROGRESS_LINES_PER_CHANNEL (default 50)
+
+## Notes
+If you want the bot to recompute a channel that was cached, delete that channel data from the DB payload.
