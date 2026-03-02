@@ -1,15 +1,15 @@
-# Discord Ticket Viewers Bot (RTDB first, Firestore fallback) - v2
+# Discord Ticket Viewers Bot (RTDB first, Firestore fallback) - v3 (cache-skip)
 
-## Fixes in this version
-- Adds frequent `await asyncio.sleep(0)` yields during heavy loops so the bot stays responsive (prevents `Unknown interaction`)
-- Starts auto update 5 seconds after bot is ready
-- Adds `/favicon.ico` route to stop noisy 404 logs
+## What changed
+- Before computing viewers, the bot reads existing data from DB (RTDB first, fallback Firestore).
+- If a ticket channel already has stored viewers, it will **skip recomputing** that channel (fast).
+  - Channel entry includes `"source": "cache_skip"` when skipped.
 
 ## What it does
 - Slash command: `/start bot_role category1 [category2] [category3]`
 - Scans channels inside selected categories
 - Keeps ONLY channels whose name contains `ticket` (case-insensitive)
-- For each ticket channel, saves a list of members who can view it, with rules:
+- For each ticket channel, saves viewers list with rules:
   - must have the selected role
   - if they have ANY other role with Administrator permission -> skipped
 
@@ -19,10 +19,10 @@
 
 ## Environment Variables
 - DISCORD_TOKEN
-- FIREBASE_JSON (paste full service account JSON)
-- FIREBASE_DATABASE_URL (optional, to enable RTDB-first writes)
+- FIREBASE_JSON
+- FIREBASE_DATABASE_URL (optional, enables RTDB)
 - AUTO_UPDATE_SECONDS (optional, default 60)
-- FIREBASE_COLLECTION (optional, Firestore fallback collection name)
+- FIREBASE_COLLECTION (optional)
 
-## Requirements
-Enable SERVER MEMBERS INTENT in Discord Developer Portal.
+## Note
+With cache-skip enabled, changes in permissions/roles will NOT be reflected for channels that were previously stored (until you delete that channel entry from DB).

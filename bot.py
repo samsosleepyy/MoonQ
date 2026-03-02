@@ -90,10 +90,78 @@ async def ensure_members_loaded(guild: discord.Guild) -> None:
     except Exception:
         pass
 
+# ================== DB (RTDB first, fallback Firestore) ==================
+
+def _write_payload_sync(guild_id: int, payload: Dict[str, Any]) -> str:
+    try:
+        if not FIREBASE_DATABASE_URL:
+            raise RuntimeError("No FIREBASE_DATABASE_URL configured")
+        rtdb.reference(f"discord_configs/{guild_id}").set(payload)
+        return "rtdb"
+    except Exception:
+        fs.collection(FIREBASE_COLLECTION).document(str(guild_id)).set(payload, merge=True)
+        return "firestore"
+
+async def write_payload(guild_id: int, payload: Dict[str, Any]) -> str:
+    return await asyncio.to_thread(_write_payload_sync, guild_id, payload)
+
+def _read_payload_sync(guild_id: int) -> Dict[str, Any]:
+    # RTDB first
+    try:
+        if not FIREBASE_DATABASE_URL:
+            raise RuntimeError("No FIREBASE_DATABASE_URL configured")
+        data = rtdb.reference(f"discord_configs/{guild_id}").get()
+        return data or {}
+    except Exception:
+        doc = fs.collection(FIREBASE_COLLECTION).document(str(guild_id)).get()
+        return doc.to_dict() or {}
+
+async def read_payload(guild_id: int) -> Dict[str, Any]:
+    return await asyncio.to_thread(_read_payload_sync, guild_id)
+
+def _read_configs_sync() -> List[Tuple[int, Dict[str, Any]]]:
+    # Used by auto update
+    try:
+        if not FIREBASE_DATABASE_URL:
+            raise RuntimeError("No FIREBASE_DATABASE_URL configured")
+        root = rtdb.reference("discord_configs").get() or {}
+        out: List[Tuple[int, Dict[str, Any]]] = []
+        for k, v in root.items():
+            try:
+                gid = int(k)
+            except Exception:
+                continue
+            out.append((gid, v or {}))
+        return out
+    except Exception:
+        out: List[Tuple[int, Dict[str, Any]]] = []
+        for doc in fs.collection(FIREBASE_COLLECTION).stream():
+            out.append((int(doc.id), doc.to_dict() or {}))
+        return out
+
+async def read_configs() -> List[Tuple[int, Dict[str, Any]]]:
+    return await asyncio.to_thread(_read_configs_sync)
+
+def build_cached_viewers_map(existing_payload: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+    """Return {channel_id: {"viewers": [...], "viewers_count": N}} from existing stored payload."""
+    out: Dict[int, Dict[str, Any]] = {}
+    for cat in (existing_payload.get("categories") or []):
+        for ch in (cat.get("ticket_channels") or []):
+            cid = ch.get("channel_id")
+            if isinstance(cid, int):
+                out[cid] = {
+                    "viewers": ch.get("viewers") or [],
+                    "viewers_count": int(ch.get("viewers_count") or 0),
+                }
+    return out
+
+# ================== Core build (with cache skip) ==================
+
 async def build_ticket_payload(
     guild: discord.Guild,
     role_id: int,
     category_ids: List[int],
+    cached_viewers: Dict[int, Dict[str, Any]],
 ) -> Dict[str, Any]:
     role = guild.get_role(role_id)
     if role is None:
@@ -109,9 +177,8 @@ async def build_ticket_payload(
     # Eligible members (ตามกฎคุณ)
     eligible_members: List[discord.Member] = []
     for i, m in enumerate(guild.members):
-        if i % 200 == 0:
+        if i % 300 == 0:
             await asyncio.sleep(0)  # yield to event loop
-
         if m.bot:
             continue
         if not any(r.id == role.id for r in m.roles):
@@ -138,11 +205,24 @@ async def build_ticket_payload(
             if not is_ticket_channel(ch):
                 continue
 
+            # ✅ CACHE: If this channel already has viewers stored, skip recompute
+            cached = cached_viewers.get(ch.id)
+            if cached is not None:
+                ticket_channels_out.append({
+                    "channel_id": ch.id,
+                    "channel_name": ch.name,
+                    "channel_type": str(ch.type),
+                    "viewers_count": int(cached.get("viewers_count") or 0),
+                    "viewers": cached.get("viewers") or [],
+                    "source": "cache_skip",
+                })
+                continue
+
+            # Otherwise compute viewers (expensive)
             viewers: List[Dict[str, Any]] = []
             for mi, m in enumerate(eligible_members):
-                if mi % 200 == 0:
+                if mi % 300 == 0:
                     await asyncio.sleep(0)  # yield
-
                 perms = ch.permissions_for(m)
                 if perms.view_channel:
                     viewers.append({
@@ -157,6 +237,7 @@ async def build_ticket_payload(
                 "channel_type": str(ch.type),
                 "viewers_count": len(viewers),
                 "viewers": viewers,
+                "source": "computed",
             })
 
         if ticket_channels_out:
@@ -176,45 +257,6 @@ async def build_ticket_payload(
         "updated_at": now_iso(),
     }
 
-# ================== DB Write (RTDB first, fallback Firestore) ==================
-
-def _write_payload_sync(guild_id: int, payload: Dict[str, Any]) -> str:
-    try:
-        if not FIREBASE_DATABASE_URL:
-            raise RuntimeError("No FIREBASE_DATABASE_URL configured")
-        rtdb.reference(f"discord_configs/{guild_id}").set(payload)
-        return "rtdb"
-    except Exception:
-        fs.collection(FIREBASE_COLLECTION).document(str(guild_id)).set(payload, merge=True)
-        return "firestore"
-
-async def write_payload(guild_id: int, payload: Dict[str, Any]) -> str:
-    return await asyncio.to_thread(_write_payload_sync, guild_id, payload)
-
-# ================== DB Read configs (RTDB first, fallback Firestore) ==================
-
-def _read_configs_sync() -> List[Tuple[int, Dict[str, Any]]]:
-    try:
-        if not FIREBASE_DATABASE_URL:
-            raise RuntimeError("No FIREBASE_DATABASE_URL configured")
-        root = rtdb.reference("discord_configs").get() or {}
-        out: List[Tuple[int, Dict[str, Any]]] = []
-        for k, v in root.items():
-            try:
-                gid = int(k)
-            except Exception:
-                continue
-            out.append((gid, v or {}))
-        return out
-    except Exception:
-        out: List[Tuple[int, Dict[str, Any]]] = []
-        for doc in fs.collection(FIREBASE_COLLECTION).stream():
-            out.append((int(doc.id), doc.to_dict() or {}))
-        return out
-
-async def read_configs() -> List[Tuple[int, Dict[str, Any]]]:
-    return await asyncio.to_thread(_read_configs_sync)
-
 # ================== Events ==================
 
 @bot.event
@@ -226,8 +268,7 @@ async def on_ready():
 
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
-    # Give the bot a moment before starting heavy background work
-    await asyncio.sleep(5)
+    await asyncio.sleep(3)
 
     if not auto_update.is_running():
         auto_update.start()
@@ -237,7 +278,7 @@ async def on_ready():
 
 @bot.tree.command(
     name="start",
-    description="บันทึกเฉพาะช่องที่มีคำว่า ticket และคนที่เห็นช่องนั้น (RTDB ก่อน, fallback Firestore)",
+    description="บันทึกเฉพาะช่องที่มีคำว่า ticket และคนที่เห็นช่องนั้น (ตรวจใน DB ก่อน ถ้ามีแล้วจะข้าม)",
 )
 @app_commands.describe(
     bot_role="บทบาทที่ต้องการนับผู้ใช้",
@@ -252,7 +293,7 @@ async def start(
     category2: Optional[discord.CategoryChannel] = None,
     category3: Optional[discord.CategoryChannel] = None,
 ):
-    # IMPORTANT: defer immediately to avoid Unknown interaction
+    # IMPORTANT: defer immediately
     await interaction.response.defer(ephemeral=True)
 
     guild = interaction.guild
@@ -268,7 +309,10 @@ async def start(
     category_ids = [c.id for c in categories]
 
     async with update_lock:
-        payload = await build_ticket_payload(guild, role_id, category_ids)
+        existing = await read_payload(guild.id)
+        cached_viewers = build_cached_viewers_map(existing)
+
+        payload = await build_ticket_payload(guild, role_id, category_ids, cached_viewers)
 
         payload["config"] = {
             "role_id": role_id,
@@ -285,13 +329,21 @@ async def start(
         saved_to = await write_payload(guild.id, payload)
 
     total_ticket_channels = sum(c.get("ticket_channels_count", 0) for c in payload.get("categories", []))
+    skipped = 0
+    computed = 0
+    for cat in payload.get("categories", []):
+        for ch in cat.get("ticket_channels", []):
+            if ch.get("source") == "cache_skip":
+                skipped += 1
+            else:
+                computed += 1
 
     await interaction.followup.send(
         f"✅ บันทึกสำเร็จ\n"
         f"- Saved to: {saved_to}\n"
         f"- Role: {bot_role.name}\n"
-        f"- Categories scanned: {len(categories)}\n"
         f"- Ticket channels found: {total_ticket_channels}\n"
+        f"- Computed: {computed} | Skipped (cached): {skipped}\n"
         f"- Auto update: every {AUTO_UPDATE_SECONDS}s",
         ephemeral=True
     )
@@ -304,7 +356,6 @@ async def auto_update():
         docs = await read_configs()
 
         for idx, (guild_id, data) in enumerate(docs):
-            # yield between guilds to keep the bot responsive
             await asyncio.sleep(0)
 
             cfg = data.get("config") or {}
@@ -317,11 +368,14 @@ async def auto_update():
             if guild is None:
                 continue
 
-            # lock only per-guild heavy work
             async with update_lock:
-                payload = await build_ticket_payload(guild, int(role_id), [int(x) for x in category_ids])
+                existing = await read_payload(int(guild_id))
+                cached_viewers = build_cached_viewers_map(existing)
+
+                payload = await build_ticket_payload(guild, int(role_id), [int(x) for x in category_ids], cached_viewers)
                 payload["config"] = cfg
                 payload["updated_by"] = {"source": "auto_update"}
+
                 await write_payload(int(guild_id), payload)
 
     except Exception as e:
