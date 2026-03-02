@@ -6,6 +6,8 @@ from discord.ext import commands, tasks
 import firebase_admin
 from firebase_admin import credentials, firestore
 from typing import Optional, Dict, Any, List
+import threading
+from flask import Flask
 
 # ================== ENV ==================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -252,5 +254,15 @@ async def before_auto_update():
     except Exception:
         pass
 
+app = Flask(__name__)
 
+@app.get("/")
+def home():
+    return "OK", 200
+
+def run_web():
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+
+threading.Thread(target=run_web, daemon=True).start()
 bot.run(DISCORD_TOKEN)
