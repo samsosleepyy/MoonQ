@@ -1,12 +1,11 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import firebase_admin
 from firebase_admin import credentials, firestore
 import os
 import asyncio
-from aiohttp import web # นำเข้าเครื่องมือสำหรับสร้างเว็บเซิร์ฟเวอร์จำลอง
 
-# --- ตั้งค่า Firebase (ฝังข้อมูลโดยตรง) ---
+# --- ตั้งค่า Firebase ---
 firebase_config = {
   "type": "service_account",
   "project_id": "moonshop-3e906",
@@ -29,29 +28,25 @@ try:
 except Exception as e:
     print(f"❌ เกิดข้อผิดพลาดในการเชื่อมต่อ Firebase: {e}")
 
-# --- สร้าง Web Server จำลองให้ Render สแกนเจอ Port ---
-async def web_server_handler(request):
-    return web.Response(text="บอท Discord กำลังทำงานอยู่!")
-
-async def start_dummy_server():
-    app = web.Application()
-    app.add_routes([web.get('/', web_server_handler)])
-    runner = web.AppRunner(app)
-    await runner.setup()
-    # ดึง Port จาก Render ถ้าไม่มีให้ใช้ 8080
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"🌐 เปิด Web Server จำลองที่ Port {port} เพื่อแก้ปัญหา Render แล้ว")
-
 # --- ตั้งค่า Discord Bot ---
 intents = discord.Intents.default()
 intents.members = True 
+# ใช้ตัวแปร bot เหมือนเดิม แต่คราวนี้เราจะใช้ร่วมกับ Slash Commands
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# --- ฟังก์ชันหลักสำหรับอัปเดตข้อมูลเซิร์ฟเวอร์ ---
+# --- ฟังก์ชันเซฟข้อมูล (แบบ Synchronous เพื่อรันใน Thread) ---
+def save_to_firestore(guild_id, server_data):
+    """ฟังก์ชันทำงานเบื้องหลังเพื่อไม่ให้รบกวนการเชื่อมต่อ Discord"""
+    try:
+        doc_ref = db.collection('server_channels').document(str(guild_id))
+        doc_ref.set({"categories": server_data}, merge=True)
+        print(f"✅ บันทึกข้อมูลลง Firebase สำเร็จ (Guild ID: {guild_id})")
+    except Exception as e:
+        print(f"❌ เกิดข้อผิดพลาดในการบันทึกข้อมูล Firestore: {e}")
+
+# --- ฟังก์ชันหลักในการดึงข้อมูลเซิร์ฟเวอร์ ---
 async def update_guild_data(guild):
-    print(f"กำลังอัปเดตข้อมูลเซิร์ฟเวอร์: {guild.name}")
+    print(f"🔄 กำลังรวบรวมข้อมูลเซิร์ฟเวอร์: {guild.name}")
     server_data = {}
 
     for channel in guild.channels:
@@ -75,6 +70,7 @@ async def update_guild_data(guild):
             if perms.view_channel:
                 viewers.append({"id": str(member.id), "name": member.name})
             
+            # ป้องกันบอทค้างตอนคนเยอะๆ
             await asyncio.sleep(0) 
 
         server_data[category_id][channel.name] = {
@@ -84,35 +80,45 @@ async def update_guild_data(guild):
         }
         await asyncio.sleep(0.1)
 
-    try:
-        doc_ref = db.collection('server_channels').document(str(guild.id))
-        # อัปเดต: โยนการเซฟฐานข้อมูลไปรันใน Thread แยก เพื่อไม่ให้ Event Loop หลักของบอทค้าง
-        await asyncio.to_thread(doc_ref.set, {"categories": server_data}, merge=True)
-        print(f"✅ บันทึกข้อมูลเซิร์ฟเวอร์ {guild.name} ลง Firebase เรียบร้อย!")
-    except Exception as e:
-        print(f"❌ เกิดข้อผิดพลาดในการบันทึกข้อมูล {guild.name}: {e}")
+    # ส่งคำสั่งเซฟลง Firebase ไปทำงานเบื้องหลัง (ไม่ให้บอทค้าง)
+    await asyncio.to_thread(save_to_firestore, guild.id, server_data)
 
-# --- อีเวนต์เมื่อบอทเริ่มทำงาน ---
+
+# --- ฟังก์ชันทำงานอัตโนมัติทุกๆ 1 นาที ---
+@tasks.loop(minutes=1)
+async def auto_update_task():
+    print("⏳ [Auto Update] เริ่มรอบอัปเดตข้อมูลทุก 1 นาที...")
+    for guild in bot.guilds:
+        await update_guild_data(guild)
+
+
+# --- คำสั่ง Slash Command: /start ---
+@bot.tree.command(name="start", description="สั่งอัปเดตข้อมูลทันที และเริ่มระบบอัปเดตอัตโนมัติทุก 1 นาที")
+async def start_command(interaction: discord.Interaction):
+    # ตอบกลับผู้ใช้ทันที
+    await interaction.response.send_message("✅ รับทราบ! กำลังอัปเดตข้อมูลเซิร์ฟเวอร์ และจะอัปเดตให้อัตโนมัติทุกๆ 1 นาทีครับ", ephemeral=True)
+    
+    # 1. ทำการอัปเดตของเซิร์ฟเวอร์นี้ทันที 1 ครั้ง
+    bot.loop.create_task(update_guild_data(interaction.guild))
+    
+    # 2. ตรวจสอบว่า loop 1 นาทีทำงานอยู่หรือไม่ ถ้ายังให้เริ่มทำงาน
+    if not auto_update_task.is_running():
+        auto_update_task.start()
+        print("▶️ เริ่มระบบ Auto Update ทุก 1 นาทีแล้ว")
+
+
+# --- อีเวนต์เมื่อบอทพร้อมทำงาน ---
 @bot.event
 async def on_ready():
-    print(f'✅ บอท {bot.user} พร้อมทำงานบน Render แล้ว!')
-    # เปิด Web server จำลอง
-    bot.loop.create_task(start_dummy_server())
+    print(f'✅ บอท {bot.user} รันสำเร็จแล้ว!')
     
-    # อัปเดตข้อมูลทุกเซิร์ฟเวอร์
-    for guild in bot.guilds:
-        bot.loop.create_task(update_guild_data(guild))
+    try:
+        # คำสั่งนี้คือพระเอกที่จะเคลียร์คำสั่ง / เก่าๆ ออกทั้งหมด และยัดคำสั่งใหม่เข้าไปแทน
+        synced = await bot.tree.sync()
+        print(f"🧹 ล้างคำสั่งเก่า และซิงค์ Slash Commands ใหม่จำนวน {len(synced)} คำสั่งเรียบร้อยแล้ว!")
+    except Exception as e:
+        print(f"❌ มีปัญหาตอนซิงค์คำสั่ง Slash Command: {e}")
 
-@bot.event
-async def on_guild_join(guild):
-    print(f"🟢 บอทเข้าร่วมเซิร์ฟเวอร์ใหม่: {guild.name}")
-    bot.loop.create_task(update_guild_data(guild))
-
-@bot.command()
-async def update_now(ctx):
-    await ctx.send("กำลังอัปเดตข้อมูลช่องและสิทธิ์การมองเห็น กรุณารอสักครู่...")
-    await update_guild_data(ctx.guild)
-    await ctx.send("✅ อัปเดตข้อมูลลง Firebase เสร็จสมบูรณ์!")
 
 # --- รันบอท ---
 DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN')
