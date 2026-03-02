@@ -3,7 +3,7 @@ import json
 import asyncio
 import threading
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Set
 
 import discord
 from discord import app_commands
@@ -17,11 +17,13 @@ from flask import Flask
 # ================== ENV ==================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 FIREBASE_JSON = os.getenv("FIREBASE_JSON")
-FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL")  # Realtime DB URL (optional)
+FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL")  # RTDB URL (optional)
 FIREBASE_COLLECTION = os.getenv("FIREBASE_COLLECTION", "discord_configs")  # Firestore fallback collection
-AUTO_UPDATE_SECONDS = int(os.getenv("AUTO_UPDATE_SECONDS", "60"))
 
-# Progress logging controls (to avoid log spam)
+# Default auto update to 5 minutes (ลดโหลด)
+AUTO_UPDATE_SECONDS = int(os.getenv("AUTO_UPDATE_SECONDS", "300"))
+
+# Progress logging controls (avoid log spam)
 PROGRESS_STEP = int(os.getenv("PROGRESS_STEP", "10"))  # prints 10,20,30,...
 MAX_PROGRESS_LINES_PER_CHANNEL = int(os.getenv("MAX_PROGRESS_LINES_PER_CHANNEL", "50"))
 
@@ -45,18 +47,25 @@ else:
     firebase_admin.initialize_app(cred)
     log("Firebase initialized WITHOUT Realtime Database URL (RTDB-first disabled; Firestore fallback only).")
 
-fs = firestore.client()  # Firestore (fallback only)
+fs = firestore.client()  # Firestore fallback
 
 # ================== Discord Init ==================
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True  # MUST enable SERVER MEMBERS INTENT in Discord Dev Portal
+intents.members = True  # MUST enable SERVER MEMBERS INTENT
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Prevent auto_update and /start from running heavy work at the same time
-update_lock = asyncio.Lock()
+# ✅ Lock per guild (concurrency across servers)
+guild_locks: Dict[int, asyncio.Lock] = {}
 
-# ================== Web Server (for Render Web Service port binding) ==================
+def get_guild_lock(guild_id: int) -> asyncio.Lock:
+    lock = guild_locks.get(guild_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        guild_locks[guild_id] = lock
+    return lock
+
+# ================== Web Server (Render Web Service port binding) ==================
 app = Flask(__name__)
 
 @app.get("/")
@@ -98,6 +107,16 @@ async def ensure_members_loaded(guild: discord.Guild) -> None:
         await guild.chunk(cache=True)
     except Exception:
         pass
+
+def _progress_print(prefix: str, i: int, total: int, line_counter: List[int]) -> None:
+    if PROGRESS_STEP <= 0:
+        return
+    if i % PROGRESS_STEP != 0:
+        return
+    if line_counter[0] >= MAX_PROGRESS_LINES_PER_CHANNEL:
+        return
+    line_counter[0] += 1
+    log(f"{prefix} {i}/{total}")
 
 # ================== DB (RTDB first, fallback Firestore) ==================
 
@@ -162,18 +181,83 @@ def build_cached_viewers_map(existing_payload: Dict[str, Any]) -> Dict[int, Dict
                 }
     return out
 
-def _progress_print(prefix: str, i: int, total: int, line_counter: List[int]) -> None:
-    # line_counter is a single-item list used as mutable integer
-    if PROGRESS_STEP <= 0:
-        return
-    if i % PROGRESS_STEP != 0:
-        return
-    if line_counter[0] >= MAX_PROGRESS_LINES_PER_CHANNEL:
-        return
-    line_counter[0] += 1
-    log(f"{prefix} {i}/{total}")
+# ================== Reverse Viewers Lookup (overwrites-first) ==================
 
-# ================== Core build (with cache skip + logs) ==================
+def _get_overwrite(target_overwrites: Dict[Any, discord.PermissionOverwrite], target: Any) -> Optional[discord.PermissionOverwrite]:
+    return target_overwrites.get(target)
+
+def _apply_overwrite(perms: discord.Permissions, ow: Optional[discord.PermissionOverwrite]) -> None:
+    if ow is None:
+        return
+    allow, deny = ow.pair()
+    perms.handle_overwrite(allow=allow.value, deny=deny.value)
+
+def role_can_view_channel(role: discord.Role, channel: discord.abc.GuildChannel) -> bool:
+    """
+    Approximate effective view_channel for a ROLE using:
+    base role perms -> category overwrites -> channel overwrites (everyone + role only).
+    This follows the request to use overwrites and avoids per-member permissions_for loops.
+    """
+    perms = role.permissions
+
+    everyone = channel.guild.default_role
+    category = getattr(channel, "category", None)
+
+    # category overwrites first
+    if isinstance(category, discord.CategoryChannel):
+        c_ows = category.overwrites
+        _apply_overwrite(perms, _get_overwrite(c_ows, everyone))
+        _apply_overwrite(perms, _get_overwrite(c_ows, role))
+
+    # then channel overwrites
+    ch_ows = channel.overwrites
+    _apply_overwrite(perms, _get_overwrite(ch_ows, everyone))
+    _apply_overwrite(perms, _get_overwrite(ch_ows, role))
+
+    return bool(perms.view_channel)
+
+def collect_denied_role_ids(channel: discord.abc.GuildChannel) -> Set[int]:
+    """Collect role IDs explicitly denied view_channel in category/channel overwrites."""
+    denied: Set[int] = set()
+    category = getattr(channel, "category", None)
+
+    if isinstance(category, discord.CategoryChannel):
+        for target, ow in category.overwrites.items():
+            if isinstance(target, discord.Role) and ow.view_channel is False:
+                denied.add(target.id)
+
+    for target, ow in channel.overwrites.items():
+        if isinstance(target, discord.Role) and ow.view_channel is False:
+            denied.add(target.id)
+
+    return denied
+
+def collect_user_overrides(channel: discord.abc.GuildChannel) -> Tuple[Set[int], Set[int]]:
+    """Return (user_allow_ids, user_deny_ids) from category+channel overwrites."""
+    allow_ids: Set[int] = set()
+    deny_ids: Set[int] = set()
+
+    category = getattr(channel, "category", None)
+    if isinstance(category, discord.CategoryChannel):
+        for target, ow in category.overwrites.items():
+            if isinstance(target, discord.Member):
+                if ow.view_channel is True:
+                    allow_ids.add(target.id)
+                elif ow.view_channel is False:
+                    deny_ids.add(target.id)
+
+    for target, ow in channel.overwrites.items():
+        if isinstance(target, discord.Member):
+            if ow.view_channel is True:
+                allow_ids.add(target.id)
+                deny_ids.discard(target.id)
+            elif ow.view_channel is False:
+                deny_ids.add(target.id)
+                allow_ids.discard(target.id)
+
+    return allow_ids, deny_ids
+
+# ================== Core build (cache skip + reverse lookup + logs) ==================
 
 async def build_ticket_payload(
     guild: discord.Guild,
@@ -181,7 +265,6 @@ async def build_ticket_payload(
     category_ids: List[int],
     cached_viewers: Dict[int, Dict[str, Any]],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Returns (payload, stats)"""
     role = guild.get_role(role_id)
     if role is None:
         return ({
@@ -193,22 +276,22 @@ async def build_ticket_payload(
 
     await ensure_members_loaded(guild)
 
-    log(f"Building payload for guild={guild.name} ({guild.id}) role={role.name} ({role.id}) categories={len(category_ids)}")
+    log(f"Building payload guild={guild.name} ({guild.id}) role={role.name} ({role.id}) categories={len(category_ids)}")
 
-    # Eligible members (ตามกฎคุณ)
-    eligible_members: List[discord.Member] = []
+    # Build eligible members once per guild
+    eligible_by_id: Dict[int, discord.Member] = {}
     for idx, m in enumerate(guild.members):
-        if idx % 300 == 0:
-            await asyncio.sleep(0)  # yield
+        if idx % 500 == 0:
+            await asyncio.sleep(0)
         if m.bot:
             continue
         if not any(r.id == role.id for r in m.roles):
             continue
         if has_any_admin_role(m, ignore_role_id=role.id):
             continue
-        eligible_members.append(m)
+        eligible_by_id[m.id] = m
 
-    log(f"Eligible members for role '{role.name}': {len(eligible_members)}")
+    log(f"Eligible members for role '{role.name}': {len(eligible_by_id)}")
 
     categories_out: List[Dict[str, Any]] = []
     computed_channels: List[str] = []
@@ -230,6 +313,7 @@ async def build_ticket_payload(
             if not is_ticket_channel(ch):
                 continue
 
+            # CACHE skip
             cached = cached_viewers.get(ch.id)
             if cached is not None:
                 skipped_channels.append(f"{cat.name}/{ch.name}")
@@ -243,34 +327,73 @@ async def build_ticket_payload(
                 })
                 continue
 
-            # Otherwise compute viewers (expensive) with progress logs
             computed_channels.append(f"{cat.name}/{ch.name}")
-            prefix = f"Counting viewers for {cat.name}/{ch.name}:"
-            line_counter = [0]
+
+            # If selected role cannot see the channel -> none
+            if not role_can_view_channel(role, ch):
+                log(f"{cat.name}/{ch.name}: role cannot view (overwrites) -> viewers=0")
+                ticket_channels_out.append({
+                    "channel_id": ch.id,
+                    "channel_name": ch.name,
+                    "channel_type": str(ch.type),
+                    "viewers_count": 0,
+                    "viewers": [],
+                    "source": "computed_overwrites_role_blocked",
+                })
+                continue
+
+            denied_role_ids = collect_denied_role_ids(ch)
+            user_allow_ids, user_deny_ids = collect_user_overrides(ch)
+
+            viewer_ids = set(eligible_by_id.keys())
+
+            # Apply user denies
+            if user_deny_ids:
+                viewer_ids.difference_update(user_deny_ids)
+
+            # Apply deny roles (coarse filter)
+            if denied_role_ids:
+                filtered = set()
+                prefix = f"Filtering deny-roles for {cat.name}/{ch.name}:"
+                line_counter = [0]
+                total = len(viewer_ids)
+                for i, mid in enumerate(viewer_ids, start=1):
+                    if i % 500 == 0:
+                        await asyncio.sleep(0)
+                    _progress_print(prefix, i, total, line_counter)
+                    mem = eligible_by_id.get(mid)
+                    if mem is None:
+                        continue
+                    if any(r.id in denied_role_ids for r in mem.roles):
+                        continue
+                    filtered.add(mid)
+                viewer_ids = filtered
+
+            # Add user-allow ids (only if eligible)
+            if user_allow_ids:
+                viewer_ids.update({uid for uid in user_allow_ids if uid in eligible_by_id})
 
             viewers: List[Dict[str, Any]] = []
-            total = len(eligible_members)
-            for i, m in enumerate(eligible_members, start=1):
-                if i % 300 == 0:
+            for idx2, mid in enumerate(viewer_ids):
+                if idx2 % 1000 == 0:
                     await asyncio.sleep(0)
-                _progress_print(prefix, i, total, line_counter)
+                mem = eligible_by_id.get(mid)
+                if mem is None:
+                    continue
+                viewers.append({
+                    "user_id": mem.id,
+                    "username": mem.name,
+                    "display_name": mem.display_name,
+                })
 
-                perms = ch.permissions_for(m)
-                if perms.view_channel:
-                    viewers.append({
-                        "user_id": m.id,
-                        "username": m.name,
-                        "display_name": m.display_name,
-                    })
-
-            log(f"Done {cat.name}/{ch.name}: viewers={len(viewers)} checked={total}")
+            log(f"Done {cat.name}/{ch.name}: viewers={len(viewers)} (reverse/overwrites) eligible={len(eligible_by_id)}")
             ticket_channels_out.append({
                 "channel_id": ch.id,
                 "channel_name": ch.name,
                 "channel_type": str(ch.type),
                 "viewers_count": len(viewers),
                 "viewers": viewers,
-                "source": "computed",
+                "source": "computed_reverse_overwrites",
             })
 
         if ticket_channels_out:
@@ -311,13 +434,11 @@ async def update_one_guild(guild: discord.Guild, cfg: Dict[str, Any], source: st
 
     saved_to = await write_payload(guild.id, payload)
 
-    # Summary logs
     log(f"Saved guild={guild.name} ({guild.id}) to {saved_to}. Ticket channels={stats['ticket_channels_total']} computed={len(stats['computed_channels'])} skipped={len(stats['skipped_channels'])}")
-
     if stats["computed_channels"]:
-        log("Updated channels (computed): " + ", ".join(stats["computed_channels"][:40]) + (" ..." if len(stats["computed_channels"]) > 40 else ""))
+        log("Updated channels (computed): " + ", ".join(stats["computed_channels"][:60]) + (" ..." if len(stats["computed_channels"]) > 60 else ""))
     if stats["skipped_channels"]:
-        log("Skipped channels (cached): " + ", ".join(stats["skipped_channels"][:40]) + (" ..." if len(stats["skipped_channels"]) > 40 else ""))
+        log("Skipped channels (cached): " + ", ".join(stats["skipped_channels"][:60]) + (" ..." if len(stats["skipped_channels"]) > 60 else ""))
 
 # ================== Events ==================
 
@@ -330,21 +451,30 @@ async def on_ready():
 
     log(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
-    # Auto-load configs from DB and run one pass immediately (so it works even if /start was done earlier)
-    await asyncio.sleep(3)
+    # Auto-load configs and run one pass immediately
+    await asyncio.sleep(2)
     try:
         docs = await read_configs()
         log(f"Loaded configs from DB: {len(docs)} guild(s)")
-        # Run one pass now (without waiting for the first loop tick)
-        for idx, (guild_id, data) in enumerate(docs):
-            await asyncio.sleep(0)
-            cfg = (data.get("config") or {})
+
+        tasks_run = []
+        for (guild_id, data) in docs:
             guild = bot.get_guild(int(guild_id))
             if guild is None:
                 log(f"Guild not found in cache: {guild_id} (bot not in guild?)")
                 continue
-            async with update_lock:
-                await update_one_guild(guild, cfg, source="startup_autoload")
+            cfg = (data.get("config") or {})
+            lock = get_guild_lock(guild.id)
+
+            async def runner(g: discord.Guild, c: Dict[str, Any], l: asyncio.Lock):
+                async with l:
+                    await update_one_guild(g, c, source="startup_autoload")
+
+            tasks_run.append(asyncio.create_task(runner(guild, cfg, lock)))
+
+        if tasks_run:
+            await asyncio.gather(*tasks_run)
+
     except Exception as e:
         log(f"Startup autoload error: {repr(e)}")
 
@@ -356,7 +486,7 @@ async def on_ready():
 
 @bot.tree.command(
     name="start",
-    description="บันทึกเฉพาะช่องที่มีคำว่า ticket และคนที่เห็นช่องนั้น (ตรวจ DB ก่อน ถ้ามีแล้วจะข้าม)",
+    description="ตั้งค่าและอัปเดทเฉพาะช่องที่มีคำว่า ticket (reverse overwrite lookup + cache skip)",
 )
 @app_commands.describe(
     bot_role="บทบาทที่ต้องการนับผู้ใช้",
@@ -388,11 +518,12 @@ async def start(
         "auto_update_seconds": AUTO_UPDATE_SECONDS,
     }
 
-    async with update_lock:
+    lock = get_guild_lock(guild.id)
+    async with lock:
         await update_one_guild(guild, cfg, source="slash_start")
 
     await interaction.followup.send(
-        "✅ ตั้งค่าและอัปเดทข้อมูลเรียบร้อยแล้ว (ดูรายละเอียดใน Render logs ได้เลย)",
+        "✅ ตั้งค่าและอัปเดทข้อมูลเรียบร้อยแล้ว (ดูรายละเอียดใน Render logs)",
         ephemeral=True
     )
 
@@ -404,15 +535,22 @@ async def auto_update():
         docs = await read_configs()
         log(f"Auto update tick: guilds={len(docs)}")
 
-        for idx, (guild_id, data) in enumerate(docs):
-            await asyncio.sleep(0)
-            cfg = (data.get("config") or {})
+        tasks_run = []
+        for (guild_id, data) in docs:
             guild = bot.get_guild(int(guild_id))
             if guild is None:
                 continue
+            cfg = (data.get("config") or {})
+            lock = get_guild_lock(guild.id)
 
-            async with update_lock:
-                await update_one_guild(guild, cfg, source="auto_update")
+            async def runner(g: discord.Guild, c: Dict[str, Any], l: asyncio.Lock):
+                async with l:
+                    await update_one_guild(g, c, source="auto_update")
+
+            tasks_run.append(asyncio.create_task(runner(guild, cfg, lock)))
+
+        if tasks_run:
+            await asyncio.gather(*tasks_run)
 
     except Exception as e:
         log(f"Auto update error: {repr(e)}")
