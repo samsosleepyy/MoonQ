@@ -1,37 +1,45 @@
 import os
 import json
 import threading
+import asyncio
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List, Tuple
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+
 import firebase_admin
-from firebase_admin import credentials, firestore, db as rtdb
+from firebase_admin import credentials, db as rtdb
+
 from flask import Flask
-from typing import Optional, Dict, Any, List
 
 # ================== ENV ==================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 FIREBASE_JSON = os.getenv("FIREBASE_JSON")
-FIREBASE_COLLECTION = os.getenv("FIREBASE_COLLECTION", "discord_configs")
-FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL")  # RTDB URL (optional but needed for RTDB)
-AUTO_UPDATE_SECONDS = int(os.getenv("AUTO_UPDATE_SECONDS", "60"))
+FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL")  # ✅ REQUIRED for RTDB-only
+AUTO_UPDATE_SECONDS = int(os.getenv("AUTO_UPDATE_SECONDS", "300"))  # default 5 min
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 if not FIREBASE_JSON:
     raise RuntimeError("Missing FIREBASE_JSON environment variable")
+if not FIREBASE_DATABASE_URL:
+    raise RuntimeError("Missing FIREBASE_DATABASE_URL environment variable (required for RTDB-only)")
 
-# ================== Firebase Init ==================
+# ================== Simple logger ==================
+def log(msg: str) -> None:
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    print(f"[{ts}] {msg}", flush=True)
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+# ================== Firebase RTDB Init (ONLY) ==================
 sa_info = json.loads(FIREBASE_JSON)
 cred = credentials.Certificate(sa_info)
-
-# init app (with RTDB if URL provided)
-if FIREBASE_DATABASE_URL:
-    firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DATABASE_URL})
-else:
-    firebase_admin.initialize_app(cred)
-
-fs = firestore.client()
+firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DATABASE_URL})
+log("Firebase initialized (Realtime Database ONLY).")
 
 # ================== Discord Init ==================
 intents = discord.Intents.default()
@@ -45,6 +53,10 @@ app = Flask(__name__)
 @app.get("/")
 def home():
     return "OK", 200
+
+@app.get("/favicon.ico")
+def favicon():
+    return "", 204
 
 def run_web():
     port = int(os.getenv("PORT", "10000"))
@@ -65,41 +77,40 @@ def has_any_admin_role(member: discord.Member, ignore_role_id: Optional[int] = N
             return True
     return False
 
-
 def is_ticket_channel(ch: discord.abc.GuildChannel) -> bool:
-    name = getattr(ch, "name", "")
+    name = getattr(ch, "name", "") or ""
     return "ticket" in name.lower()
 
-
 async def ensure_members_loaded(guild: discord.Guild) -> None:
-    # For large servers, this helps ensure we can iterate members reliably
     try:
         await guild.chunk(cache=True)
     except Exception:
         pass
 
+# ================== RTDB Read/Write ==================
 
-def write_with_fallback(guild_id: int, payload: Dict[str, Any]) -> str:
-    """
-    Try RTDB first:
-      /discord_configs/{guild_id}
-    If fails -> Firestore:
-      {FIREBASE_COLLECTION}/{guild_id}
-    Returns: "rtdb" or "firestore"
-    """
-    # 1) RTDB attempt
-    try:
-        if not FIREBASE_DATABASE_URL:
-            raise RuntimeError("No FIREBASE_DATABASE_URL configured")
+def rtdb_ref(path: str):
+    return rtdb.reference(path)
 
-        ref = rtdb.reference(f"discord_configs/{guild_id}")
-        ref.set(payload)
-        return "rtdb"
-    except Exception as e:
-        # 2) Firestore fallback
-        fs.collection(FIREBASE_COLLECTION).document(str(guild_id)).set(payload, merge=True)
-        return "firestore"
+def write_rtdb(guild_id: int, payload: Dict[str, Any]) -> None:
+    rtdb_ref(f"discord_configs/{guild_id}").set(payload)
 
+def read_rtdb(guild_id: int) -> Dict[str, Any]:
+    return rtdb_ref(f"discord_configs/{guild_id}").get() or {}
+
+def read_all_configs() -> List[Tuple[int, Dict[str, Any]]]:
+    root = rtdb_ref("discord_configs").get() or {}
+    out: List[Tuple[int, Dict[str, Any]]] = []
+    if isinstance(root, dict):
+        for k, v in root.items():
+            try:
+                gid = int(k)
+            except Exception:
+                continue
+            out.append((gid, v or {}))
+    return out
+
+# ================== Core payload build (member->channel check) ==================
 
 async def build_ticket_payload(
     guild: discord.Guild,
@@ -112,11 +123,11 @@ async def build_ticket_payload(
             "guild_id": guild.id,
             "guild_name": guild.name,
             "error": f"Role {role_id} not found",
+            "updated_at": now_iso(),
         }
 
     await ensure_members_loaded(guild)
 
-    # Pre-filter eligible members once (ตามกฎของคุณ)
     eligible_members: List[discord.Member] = []
     for m in guild.members:
         if m.bot:
@@ -128,14 +139,12 @@ async def build_ticket_payload(
         eligible_members.append(m)
 
     categories_out: List[Dict[str, Any]] = []
-
     for cid in category_ids:
         cat = guild.get_channel(cid)
         if not isinstance(cat, discord.CategoryChannel):
             continue
 
         ticket_channels_out: List[Dict[str, Any]] = []
-
         for ch in cat.channels:
             if not is_ticket_channel(ch):
                 continue
@@ -158,7 +167,6 @@ async def build_ticket_payload(
                 "viewers_count": len(viewers),
             })
 
-        # บันทึกเฉพาะ category ที่มี ticket channel อย่างน้อย 1 ช่อง
         if ticket_channels_out:
             categories_out.append({
                 "category_id": cat.id,
@@ -173,6 +181,7 @@ async def build_ticket_payload(
         "selected_role": {"role_id": role.id, "role_name": role.name},
         "categories": categories_out,
         "categories_count": len(categories_out),
+        "updated_at": now_iso(),
     }
 
 # ================== Discord Events ==================
@@ -182,17 +191,41 @@ async def on_ready():
     try:
         await bot.tree.sync()
     except Exception as e:
-        print("Command sync failed:", e)
+        log(f"Command sync failed: {repr(e)}")
 
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    log(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+    # Autoload configs saved previously (RTDB) and run one update pass
+    await asyncio.sleep(2)
+    try:
+        docs = await asyncio.to_thread(read_all_configs)
+        log(f"Autoload configs from RTDB: {len(docs)} guild(s)")
+
+        for guild_id, data in docs:
+            cfg = (data.get("config") or {})
+            role_id = cfg.get("role_id")
+            category_ids = cfg.get("category_ids")
+            if not role_id or not category_ids:
+                continue
+            guild = bot.get_guild(int(guild_id))
+            if guild is None:
+                continue
+            log(f"Startup update guild={guild.name} ({guild.id})")
+            payload = await build_ticket_payload(guild, int(role_id), [int(x) for x in category_ids])
+            payload["config"] = cfg
+            payload["updated_by"] = {"source": "startup_autoload"}
+            write_rtdb(guild.id, payload)
+            log(f"Startup update saved guild={guild.name} ({guild.id})")
+    except Exception as e:
+        log(f"Startup autoload error: {repr(e)}")
 
     if not auto_update.is_running():
         auto_update.start()
-        print(f"Auto update started every {AUTO_UPDATE_SECONDS} seconds")
+        log(f"Auto update started every {AUTO_UPDATE_SECONDS} seconds")
 
 # ================== Slash Command ==================
 
-@bot.tree.command(name="start", description="บันทึก ticket channels และคนที่เห็นช่องนั้น (RTDB ก่อน, fallback Firestore)")
+@bot.tree.command(name="start", description="บันทึก ticket channels และคนที่เห็นช่องนั้น (RTDB ONLY)")
 @app_commands.describe(
     bot_role="บทบาทที่ต้องการนับผู้ใช้",
     category1="หมวดหมู่ (บังคับ)",
@@ -220,10 +253,7 @@ async def start(
     role_id = bot_role.id
     category_ids = [c.id for c in categories]
 
-    # สร้าง payload ตามสเปก ticket+viewers
     payload = await build_ticket_payload(guild, role_id, category_ids)
-
-    # แนบ config ให้ auto-update ใช้
     payload["config"] = {
         "role_id": role_id,
         "category_ids": category_ids,
@@ -235,15 +265,13 @@ async def start(
         "display_name": interaction.user.display_name,
         "source": "slash_start",
     }
-    payload["updated_at"] = firestore.SERVER_TIMESTAMP  # ถ้า RTDB จะเป็น object เฉยๆ ไม่เป็น timestamp จริง แต่ไม่เป็นไร
 
-    saved_to = write_with_fallback(guild.id, payload)
+    # ✅ RTDB only
+    write_rtdb(guild.id, payload)
 
-    # สรุปผลตอบกลับ
     total_ticket_channels = sum(c["ticket_channels_count"] for c in payload.get("categories", []))
     await interaction.followup.send(
-        f"✅ บันทึกสำเร็จ\n"
-        f"- Saved to: {saved_to}\n"
+        f"✅ บันทึกสำเร็จ (RTDB)\n"
         f"- Role: {bot_role.name}\n"
         f"- Categories scanned: {len(categories)}\n"
         f"- Ticket channels found: {total_ticket_channels}\n"
@@ -256,31 +284,27 @@ async def start(
 @tasks.loop(seconds=60)
 async def auto_update():
     try:
-        # อ่าน config จาก Firestore ก่อน (เพราะ RTDB อาจไม่ได้เปิดเสมอ)
-        # ถ้าอยากอ่านจาก RTDB ด้วยได้ แต่โค้ดจะยาวขึ้น
-        for doc in fs.collection(FIREBASE_COLLECTION).stream():
-            data = doc.to_dict() or {}
-            cfg = data.get("config") or {}
+        docs = await asyncio.to_thread(read_all_configs)
+        log(f"Auto update tick: guilds={len(docs)}")
+
+        for guild_id, data in docs:
+            cfg = (data.get("config") or {})
             role_id = cfg.get("role_id")
             category_ids = cfg.get("category_ids")
-
             if not role_id or not category_ids:
                 continue
 
-            guild_id = int(doc.id)
-            guild = bot.get_guild(guild_id)
+            guild = bot.get_guild(int(guild_id))
             if guild is None:
                 continue
 
             payload = await build_ticket_payload(guild, int(role_id), [int(x) for x in category_ids])
             payload["config"] = cfg
             payload["updated_by"] = {"source": "auto_update"}
-            payload["updated_at"] = firestore.SERVER_TIMESTAMP
-
-            write_with_fallback(guild_id, payload)
+            write_rtdb(int(guild_id), payload)
 
     except Exception as e:
-        print("Auto update error:", repr(e))
+        log(f"Auto update error: {repr(e)}")
 
 @auto_update.before_loop
 async def before_auto_update():
