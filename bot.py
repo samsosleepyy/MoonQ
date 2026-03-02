@@ -43,7 +43,7 @@ intents.guilds = True
 intents.members = True  # MUST enable SERVER MEMBERS INTENT in Discord Dev Portal
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Prevent auto_update and /start from blocking each other
+# Prevent auto_update and /start from running heavy work at the same time
 update_lock = asyncio.Lock()
 
 # ================== Web Server (for Render Web Service port binding) ==================
@@ -52,6 +52,10 @@ app = Flask(__name__)
 @app.get("/")
 def home():
     return "OK", 200
+
+@app.get("/favicon.ico")
+def favicon():
+    return "", 204
 
 def run_web():
     port = int(os.getenv("PORT", "10000"))
@@ -104,7 +108,10 @@ async def build_ticket_payload(
 
     # Eligible members (ตามกฎคุณ)
     eligible_members: List[discord.Member] = []
-    for m in guild.members:
+    for i, m in enumerate(guild.members):
+        if i % 200 == 0:
+            await asyncio.sleep(0)  # yield to event loop
+
         if m.bot:
             continue
         if not any(r.id == role.id for r in m.roles):
@@ -115,18 +122,27 @@ async def build_ticket_payload(
 
     categories_out: List[Dict[str, Any]] = []
 
-    for cid in category_ids:
+    for ci, cid in enumerate(category_ids):
+        if ci % 3 == 0:
+            await asyncio.sleep(0)  # yield
+
         cat = guild.get_channel(cid)
         if not isinstance(cat, discord.CategoryChannel):
             continue
 
         ticket_channels_out: List[Dict[str, Any]] = []
-        for ch in cat.channels:
+        for ch_i, ch in enumerate(cat.channels):
+            if ch_i % 10 == 0:
+                await asyncio.sleep(0)  # yield
+
             if not is_ticket_channel(ch):
                 continue
 
             viewers: List[Dict[str, Any]] = []
-            for m in eligible_members:
+            for mi, m in enumerate(eligible_members):
+                if mi % 200 == 0:
+                    await asyncio.sleep(0)  # yield
+
                 perms = ch.permissions_for(m)
                 if perms.view_channel:
                     viewers.append({
@@ -209,6 +225,10 @@ async def on_ready():
         print("Command sync failed:", repr(e))
 
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+    # Give the bot a moment before starting heavy background work
+    await asyncio.sleep(5)
+
     if not auto_update.is_running():
         auto_update.start()
         print(f"Auto update started every {AUTO_UPDATE_SECONDS}s")
@@ -281,24 +301,27 @@ async def start(
 @tasks.loop(seconds=60)
 async def auto_update():
     try:
-        async with update_lock:
-            docs = await read_configs()
+        docs = await read_configs()
 
-            for guild_id, data in docs:
-                cfg = data.get("config") or {}
-                role_id = cfg.get("role_id")
-                category_ids = cfg.get("category_ids")
-                if not role_id or not category_ids:
-                    continue
+        for idx, (guild_id, data) in enumerate(docs):
+            # yield between guilds to keep the bot responsive
+            await asyncio.sleep(0)
 
-                guild = bot.get_guild(int(guild_id))
-                if guild is None:
-                    continue
+            cfg = data.get("config") or {}
+            role_id = cfg.get("role_id")
+            category_ids = cfg.get("category_ids")
+            if not role_id or not category_ids:
+                continue
 
+            guild = bot.get_guild(int(guild_id))
+            if guild is None:
+                continue
+
+            # lock only per-guild heavy work
+            async with update_lock:
                 payload = await build_ticket_payload(guild, int(role_id), [int(x) for x in category_ids])
                 payload["config"] = cfg
                 payload["updated_by"] = {"source": "auto_update"}
-
                 await write_payload(int(guild_id), payload)
 
     except Exception as e:
